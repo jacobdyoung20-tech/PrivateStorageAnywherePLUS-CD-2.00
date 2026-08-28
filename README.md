@@ -100,6 +100,14 @@ PrivateStorageAnywherePLUS-CD-2.00-FINAL-source.zip
 7211B5430F2959C780315012C7FCD446C98697819DFFDCD5D822DC1BD738412F
 ```
 
+## Security scan and false positives
+
+The exact install ZIP identified by the SHA-256 above has a public [VirusTotal report](https://www.virustotal.com/gui/file/6ede4eb366c46f56b32fabfcbd4cebdd29f0e819c4dd984f9ea92d33e4bdc66f). At the time of the documented scan, 2 of 67 vendors returned generic heuristic/ML detections, while the other 65 reported it undetected.
+
+This release contains an unsigned Windows ASI module that legitimately pattern-scans, hooks game functions, and changes game memory at runtime. Those techniques are normal for this mod but can resemble injector or cheat behavior to automated scanners. A small number of generic detections should not be treated as proof of either safety or malware; verify the hash, review the public source and build documentation, and make your own informed decision.
+
+The tested binary has not been repacked, obfuscated, or altered to chase a zero-detection score. Changing it would invalidate the tested hash and require a new release and test cycle.
+
 ## Known non-blocking warnings
 
 The following log messages have working fallbacks and do not prevent the release from functioning:
