@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a Crimson Desert 2.00 runtime or compatibility problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please copy `bin64\\PrivateStorageAnywhere.log` before launching the game again. Remove personal information before posting.
+  - type: checkboxes
+    attributes:
+      label: Pre-checks
+      options:
+        - label: I am using Crimson Desert 2.00.
+          required: true
+        - label: I disabled every other Private Storage Anywhere installation.
+          required: true
+        - label: I tested from normal gameplay with no menu open.
+          required: true
+  - type: dropdown
+    attributes:
+      label: Panel
+      options:
+        - F4 Private Storage
+        - F5 Gatherables
+        - F6 Dresser
+        - F7 Refrigerator
+        - F8 Symbol Storage
+        - F9 Collecting Storage
+        - Startup / no key pressed
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include whether the game crashed, froze, stuttered, or remained responsive.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Log attachment
+      description: Drag the complete PrivateStorageAnywhere.log file here. Do not paste credentials or personal data.
+    validations:
+      required: true
