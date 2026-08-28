@@ -1,0 +1,124 @@
+# PrivateStorageAnywherePLUS — Crimson Desert 2.00
+
+An unofficial community compatibility and feature build of **PrivateStorageAnywherePLUS** for **Crimson Desert 2.00**.
+
+Open Private Storage and all five housing storage panels from normal gameplay. Private Storage capacity can be changed in the INI, while the five housing chests remain expanded to 1,000 slots each.
+
+> [!IMPORTANT]
+> This build is matched to Crimson Desert 2.00 and has been tested only on that version. It will not work on 1.18.2 or earlier.
+
+## Download
+
+Download `PrivateStorageAnywherePLUS-CD-2.00-FINAL.zip` from this repository's **Releases** page. The GitHub source archive is not the installable mod package.
+
+The released ASI is byte-for-byte identical to the build tested in game.
+
+## Features
+
+| Key | Panel | Capacity behavior |
+| --- | --- | --- |
+| F4 | Private Storage | Configurable with `PrivateStorageSlots` |
+| F5 | Gatherables Chest | Fixed at 1,000 slots |
+| F6 | Dresser | Fixed at 1,000 slots |
+| F7 | Refrigerator | Fixed at 1,000 slots |
+| F8 | Symbol Storage | Fixed at 1,000 slots |
+| F9 | Collecting Storage | Fixed at 1,000 slots |
+| F11 | Reload INI | Reloads settings without restarting the game |
+
+- Uses the game's native storage interface.
+- Each panel supports configurable keyboard and controller bindings.
+- Blocks unsafe opens instead of forcing the UI during loading, cutscenes, or other unsafe states.
+- Writes a diagnostic log that can identify most future compatibility failures.
+- Makes no permanent save-file changes; runtime changes disappear when the game closes.
+
+## Compatibility
+
+- Game: Crimson Desert 2.00
+- Executable: `bin64\CrimsonDesert.exe`
+- Expected PE `SizeOfImage`: `0x16499000`
+- ASI loader: required for manual installation
+
+A later game update may move internal functions again. If the mod stops working after an update, preserve `bin64\PrivateStorageAnywhere.log` before launching the game again and open a bug report.
+
+## Installation
+
+### DMM (recommended)
+
+1. Download `PrivateStorageAnywherePLUS-CD-2.00-FINAL.zip` from Releases.
+2. Import that ZIP into DMM.
+3. Disable or remove every other Private Storage Anywhere entry. Only one copy may be active.
+4. Enable this release and launch the game.
+
+### Manual
+
+1. Extract `PrivateStorageAnywhere.asi` and `PrivateStorageAnywhere.ini` from the release ZIP.
+2. Copy both files into `<Crimson Desert>\bin64\`.
+3. Confirm that no second `PrivateStorageAnywhere.asi` is active.
+4. Launch through your normal ASI-loader setup.
+
+To uninstall, disable the DMM entry or remove `PrivateStorageAnywhere.asi`. The INI and log can also be removed.
+
+## Capacity settings
+
+The two capacity features are independent.
+
+### F5–F9 housing chests
+
+The five housing chests are always expanded to 1,000 slots. This runs on a separate path before `PrivateStorageSlots` is read. Changing the F4 setting cannot reduce these chests.
+
+### F4 Private Storage
+
+Set `PrivateStorageSlots` under `[Settings]`:
+
+```ini
+PrivateStorageSlots=0
+```
+
+`0` is the safe default. It leaves Private Storage at the game's intended capacity and restores the normal value if this process previously changed it.
+
+```ini
+PrivateStorageSlots=1000
+```
+
+This makes the total exactly 1,000, including purchased expansions. The setting is re-read whenever a panel opens; close and reopen the panel after editing the INI. F11 also reloads the configuration.
+
+Leave `PrivateStorageExpansions=-1` unless automatic expansion detection is wrong.
+
+## Verified release hashes
+
+```text
+PrivateStorageAnywherePLUS-CD-2.00-FINAL.zip
+6EDE4EB366C46F56B32FABFCBD4CEBDD29F0E819C4DD984F9EA92D33E4BDC66F
+
+PrivateStorageAnywhere.asi
+C2B9848F33A3822532C563C31965F4DFF74B0D02A369AE7626D3E43056C49840
+
+PrivateStorageAnywhere.ini
+9A949FD3FCD3845C1FD8FB93247620F0D8DADB17C8DCC2DB5F3DDE4AF4EC8FCD
+
+PrivateStorageAnywherePLUS-CD-2.00-FINAL-source.zip
+7211B5430F2959C780315012C7FCD446C98697819DFFDCD5D822DC1BD738412F
+```
+
+## Known non-blocking warnings
+
+The following log messages have working fallbacks and do not prevent the release from functioning:
+
+- `SetDonationFaction: FAIL` followed by `DonationOff: FALLBACK`
+- `SetTitleDir: FAIL`
+- `Type resolver: DISABLED`
+- `Gatherables panel-id lookup FAILED` followed by INI fallback behavior
+
+The inherited startup banner may say “Press F6” for Private Storage. The correct default is **F4**. The tested binary was kept unchanged for release integrity.
+
+## Building from source
+
+See [BUILDING.md](BUILDING.md). The original v1.5.10 ASI and the game executable are intentionally not included. You must supply legally obtained copies with the exact expected hashes/version.
+
+## Credits and status
+
+This is an **unofficial, independent compatibility release**, not an official Stevi release and not affiliated with Pearl Abyss.
+
+It is derived from **PrivateStorageAnywherePLUS v1.5.10 by Stevi (Stevi2195)** and is distributed with permission. The 2.00 compatibility work, capacity behavior, diagnostics, validation, packaging, and documentation were developed separately for this release. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the complete attribution and scope.
+
+Technical history is preserved in [docs/FINDINGS-2.00.md](docs/FINDINGS-2.00.md).

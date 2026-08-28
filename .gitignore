@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+*.dmp
+*.tmp
+*.bak
+.venv/
+venv/
+.tools/
+original/
+patched/
+release-assets/
+*.asi
+*.exe
+*.dll
+*.zip

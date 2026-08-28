@@ -1,0 +1,38 @@
+# Changelog
+
+## Crimson Desert 2.00 compatibility release
+
+Tested on Crimson Desert 2.00: all six panels opened and closed, both capacity behaviors were confirmed, and no crash or freeze occurred.
+
+### Fixed
+
+- Replaced three stale game addresses that caused the 1.18.2 build to crash on 2.00.
+- Restored the early exit that makes `PrivateStorageSlots=0` safe while still allowing a previously changed value to be restored.
+- Updated the mode-state layout for Crimson Desert 2.00.
+- Corrected mode and sub-mode detection to use offsets `+0x28` and `+0x29`.
+- Changed the patcher to derive game-side targets from executable structure rather than typed addresses.
+
+### Added
+
+- Deterministic build output for the tested 2.00 executable.
+- Independent layout derivation and validation tools.
+- Build-time ambiguity checks that stop instead of emitting an unsafe ASI.
+- A guarded diagnostic probe for refused storage opens.
+- Validation of hook bytes, section layout, exception data, stack arithmetic, field offsets, vararg marshalling, stale addresses, and memory writes.
+
+### Capacity behavior
+
+- F5–F9 housing chests remain fixed at 1,000 slots.
+- F4 Private Storage is separately configurable with `PrivateStorageSlots`.
+- `PrivateStorageSlots=0` restores/defaults to normal game capacity.
+- `PrivateStorageSlots=1000` sets the total to exactly 1,000, including purchased expansions.
+
+### Diagnostic build history
+
+- **AT:** resolved moved addresses but read the wrong mode offset, producing safe `BLOCKED` results.
+- **AU:** attempted a broad pointer search; it was unsafe, withdrawn, and never reused.
+- **AV:** used guarded fixed candidates safely, but its secondary log labels were incorrect; retracted as diagnostic evidence.
+- **AW:** captured the exact mode object passed by the game and proved the object route was already correct.
+- **AX:** corrected the mode/sub-mode offsets. Five bytes differed from AW; this became the tested final release.
+
+See [docs/FINDINGS-2.00.md](docs/FINDINGS-2.00.md) for the full evidence trail.

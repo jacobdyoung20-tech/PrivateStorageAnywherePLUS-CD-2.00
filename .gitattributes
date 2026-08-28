@@ -1,0 +1,9 @@
+* text=auto
+*.md text eol=lf
+*.txt text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.asi binary
+*.dll binary
+*.exe binary
+*.zip binary
