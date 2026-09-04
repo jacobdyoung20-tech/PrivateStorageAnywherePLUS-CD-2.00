@@ -294,9 +294,10 @@ def derive_game_targets(exe_path):
             if not any(r in win[:b] for r in slot):
                 continue
             proof += 1
-            # The manager whose buckets this key walks is the manager the
-            # [PRIV] feature will use, so read it off the same site rather
-            # than from a scan of SetInventory that 2.01.00 emptied out.
+            # The manager whose buckets this key walks. It is reported at
+            # build time and nothing is derived from it: on 2.01.00 it is a
+            # different table from InventoryInfo, which is derived separately
+            # below and is the one every feature in this build walks.
             for mm in re.finditer(rb"[\x48-\x4F]\x8B[\x05\x0D\x15\x1D\x25\x2D\x35\x3D]",
                                   win[:b]):
                 k = mm.start()
@@ -311,7 +312,110 @@ def derive_game_targets(exe_path):
         raise RuntimeError("the inventory manager behind NameToKey is not "
                            "unique: " + str(sorted(hex(x) for x in managers)))
     out["NAME_TO_KEY"] = INV_NAME_TO_KEY
-    out["INV_MGR_GLOBAL"] = next(iter(managers))
+    out["NAME_TO_KEY_MGR"] = next(iter(managers))
+
+    # The InventoryInfo manager the slot patcher walks. Until this build it was
+    # the manager behind the NameToKey site above, but a live survey on
+    # 2.01.00 (2026-09-04) found that one holding 1119 records of another
+    # table, so the pristine loop at ASI 0x8720 walked the wrong array and
+    # rewrote nothing. Anchor on the game's own InventoryInfo error path: the
+    # unique string "[InventoryInfo]" is referenced from exactly one function,
+    # which right before that reference resolves an InventoryInfoKey name and
+    # hands the key to the record getter. The getter, behind a `jmp` thunk,
+    # loads the manager global with `mov r11,[rip+disp]` and runs the bucket
+    # idiom on it ([mgr+0x6c] guard, [mgr+0x68] modulus, [mgr+0x78] buckets,
+    # [mgr+0x80] cells). That is the manager whose records carry the
+    # InventoryInfo slot words, whatever NameToKey clone the [PRIV] feature
+    # happens to call.
+    tag = b"[InventoryInfo]"      # opens the "[InventoryInfo] InventoryInfoKey[...]" message
+    tag_at = data.find(tag)
+    if tag_at < 0 or data.find(tag, tag_at + 1) >= 0:
+        raise RuntimeError("the [InventoryInfo] string is not unique in this executable")
+    tag_rva = pe.get_rva_from_offset(tag_at)
+    lea_rip = re.compile(rb"[\x48\x4C]\x8D[\x05\x0D\x15\x1D\x25\x2D\x35\x3D]")
+
+    def _lea_refs(target):
+        found = []
+        for sec in code:
+            blob = sec.get_data()
+            for m in lea_rip.finditer(blob):
+                k = m.start()
+                if sec.VirtualAddress + k + 7 + struct.unpack_from("<i", blob, k + 3)[0] == target:
+                    found.append((sec, k))
+        return found
+
+    sites = _lea_refs(tag_rva)
+    if len(sites) != 1:
+        raise RuntimeError(f"[InventoryInfo] is referenced from {len(sites)} sites, expected 1")
+    sec, k = sites[0]
+    # Every call in the window is body-checked, and the answer has to be
+    # unique. Taking the last qualifying call instead would be a guess: the
+    # bucket-walk shape below is the generic StaticInfoManager2 getter, shared
+    # by 110 functions over 56 different managers in this image, so a future
+    # exe that calls another table's getter here would hand back that table's
+    # manager with nothing to notice it. Two calls precede the reference today
+    # (the name resolver at game+0x1A145CC, then the getter at 0x1A145D9) and
+    # only the getter has this shape.
+    blob = sec.get_data()
+    lo = max(0, k - 0x40)
+    getters = {}
+    for m in re.finditer(rb"\xE8", blob[lo:k]):
+        ci = lo + m.start()
+        tgt = sec.VirtualAddress + ci + 5 + struct.unpack_from("<i", blob, ci + 1)[0]
+        head = _read(tgt, 5)
+        if len(head) != 5:
+            continue
+        if head[0] == 0xE9:                   # jmp thunk
+            tgt = tgt + 5 + struct.unpack_from("<i", head, 1)[0]
+        elif tgt not in starts:
+            continue
+        body = _read(tgt, 0x80)
+        mm = re.search(rb"\x4C\x8B\x1D(....)", body, re.S)   # mov r11,[rip+disp]
+        if not mm:
+            continue
+        if not (b"\xF7\xF1" in body and re.search(rb"\xC1[\xE0-\xE7]\x08", body)
+                and re.search(rb"\x83[\x78-\x7F]\x6C\x00", body)):
+            continue                          # div, shl 8, [mgr+0x6c] guard
+        getters[tgt] = tgt + mm.end() + struct.unpack("<i", mm.group(1))[0]
+    if len(getters) != 1:
+        raise RuntimeError(
+            "the [InventoryInfo] reference is not preceded by exactly one "
+            "record getter that walks a manager's buckets: "
+            + str(sorted(f"{g:#x}->{mgr:#x}" for g, mgr in getters.items())))
+    (getter, inv_mgr), = getters.items()
+    out["INV_MGR_GLOBAL"] = inv_mgr
+    out["INV_GETTER"] = getter
+
+    # The field the loop rewrites. The InventoryInfo deserializer reads
+    # _defaultSlotCount into the record with `lea rdx,[rec+OFF] ; mov r8d,2 ;
+    # call [vtbl+8]` and names the field in the message it logs when that
+    # read fails. Find the message, its single reference, and the lea before
+    # it; the pristine loop hardcodes +0x48 in a disp8, so a moved field must
+    # fail the build rather than write into whatever now lives at +0x48.
+    fld = data.find(b"_defaultSlotCount")
+    if fld < 0 or data.find(b"_defaultSlotCount", fld + 1) >= 0:
+        raise RuntimeError("the _defaultSlotCount message is not unique")
+    nul = data.rfind(b"\x00", fld - 0x40, fld)
+    if nul < 0:
+        raise RuntimeError("the _defaultSlotCount message does not start within 0x40 "
+                           "bytes of the field name")
+    msg_rva = pe.get_rva_from_offset(nul + 1)
+    refs = _lea_refs(msg_rva)
+    if len(refs) != 1:
+        raise RuntimeError(f"the _defaultSlotCount message has {len(refs)} references, expected 1")
+    sec, k = refs[0]
+    win = sec.get_data()[max(0, k - 0x30):k]
+    m = None
+    for m in re.finditer(rb"\x48\x8D[\x50-\x57](.)\x41\xB8\x02\x00\x00\x00", win, re.S):
+        pass                                   # the last one before the lea
+    if m is None:
+        raise RuntimeError("no `lea rdx,[rec+off] ; mov r8d,2` precedes the "
+                           "_defaultSlotCount message")
+    out["INV_SLOT_FIELD"] = m.group(1)[0]
+    if out["INV_SLOT_FIELD"] != 0x48:
+        raise RuntimeError(
+            f"InventoryInfo._defaultSlotCount now sits at +{out['INV_SLOT_FIELD']:#x}; the "
+            "pristine slot loop at ASI 0x8720 hardcodes +0x48 and must be relocated")
 
     # The actor handle resolver, `Out* Resolve(Holder*, Out* out)`. 2.00 keyed on
     # the exact prologue `mov [rsp+0x10],rdx ; push rbx ; sub rsp,0x30 ;
@@ -514,7 +618,10 @@ def main() -> None:
     print(f"derived  mainchar-scan disp8=0x{t['MAINCHAR_DISP8']:X} "
           f"window=0x{t['MAINCHAR_WINDOW']:X}..0x{t['MAINCHAR_WINDOW'] + 0xFF:X} "
           f"-> global=0x{t['MAINCHAR_GLOBAL']:X}")
-    print(f"derived  inventory-manager global=0x{t['INV_MGR_GLOBAL']:X}")
+    print(f"derived  InventoryInfo manager global=0x{t['INV_MGR_GLOBAL']:X} "
+          f"(getter game+0x{t['INV_GETTER']:X}, via [InventoryInfo]); "
+          f"NameToKey site manager=0x{t['NAME_TO_KEY_MGR']:X}; "
+          f"_defaultSlotCount at rec+0x{t['INV_SLOT_FIELD']:X}")
     print(f"derived  ingame-mode={t['ingame_mode']} store-sub={t['store_sub']}")
     image = bytearray(source.read_bytes())
     digest = hashlib.sha256(image).hexdigest()

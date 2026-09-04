@@ -265,6 +265,9 @@ def main() -> None:
         ("2.00", (("NAME_TO_KEY", 0x1E37F50), ("RESOLVE_ACTOR", 0x75BF90),
                   ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", 0x530E20),
                   ("MAINCHAR", 0x6330A78))),
+        # 2.01.00's first build walked the manager behind the NameToKey site,
+        # which is not the InventoryInfo table; no build may bake it again.
+        ("2.01.00 wrong table", (("INV_MGR_GLOBAL", 0x6C2C078),)),
     )
     print("\nstale values from earlier game versions")
     for ver, vals in historical:
