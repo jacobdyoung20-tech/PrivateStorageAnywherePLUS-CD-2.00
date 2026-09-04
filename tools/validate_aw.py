@@ -248,13 +248,32 @@ def main() -> None:
           "the three trailing nops of the patch qword are emitted")
 
     # ------------------------------------------------------- stale-value sweep
-    print("\nstale 1.18.2 values")
-    for name, val in (("NAME_TO_KEY", 0x1E141D0), ("RESOLVE_ACTOR", 0x751D20),
-                      ("CAMP_NAME", 0x4FC0560), ("MAINCHAR", 0x62C1500)):
-        check(struct.pack("<I", val) not in img, f"no 1.18.2 {name} immediate survives")
-    for name, val in (("NAME_TO_KEY", 0x1E37F50), ("RESOLVE_ACTOR", 0x75BF90),
-                      ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", ms)):
-        check(struct.pack("<I", val) in img, f"2.00 {name} immediate present")
+    # Both halves used to name 2.00's addresses literally, which made the
+    # validator itself a stale constant: on 2.01.00 it demanded the presence of
+    # exactly the three addresses the build had correctly replaced. Check the
+    # derived targets are baked in, and that no address from any *other* game
+    # version survives, so this stays true for whatever version is built next.
+    derived = {"NAME_TO_KEY": targets["NAME_TO_KEY"],
+               "RESOLVE_ACTOR": targets["RESOLVE_ACTOR"],
+               "CAMP_NAME": targets["CAMP_NAME"],
+               "MODE_SWITCH": ms}
+    historical = (
+        ("1.18.2", (("NAME_TO_KEY", 0x1E141D0), ("RESOLVE_ACTOR", 0x751D20),
+                    ("CAMP_NAME", 0x4FC0560), ("MAINCHAR", 0x62C1500))),
+        ("2.00", (("NAME_TO_KEY", 0x1E37F50), ("RESOLVE_ACTOR", 0x75BF90),
+                  ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", 0x530E20))),
+    )
+    print("\nstale values from earlier game versions")
+    for ver, vals in historical:
+        for name, val in vals:
+            if val in derived.values():
+                continue          # this build legitimately targets that version
+            check(struct.pack("<I", val) not in img,
+                  f"no {ver} {name} immediate survives")
+    print("\nderived targets baked into the ASI")
+    for name, val in derived.items():
+        check(struct.pack("<I", val) in img,
+              f"derived {name} (0x{val:X}) immediate present")
 
     if listing:
         print("\n--- AW block listing ---")
