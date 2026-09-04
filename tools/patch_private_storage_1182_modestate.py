@@ -59,7 +59,6 @@ SECTION_STR = 0x29020      # "Settings"
 INI_PATH = 0x3D3A0         # the mod's MAX_PATH INI path buffer
 GPP_INT = 0x28100          # IAT: GetPrivateProfileIntA
 GAME_BASE = 0x3D350        # game image base
-GAME_SIZE = 0x3D358        # and its SizeOfImage, stored beside it
 # Game-side targets. Every one of these moved between 1.18.2 and 2.00, so
 # they are derived from the executable at build time -- see
 # derive_game_targets() -- rather than carried as constants.
@@ -373,7 +372,7 @@ def derive_game_targets(exe_path):
             out["CAMP_NAME"] = rva
             break
 
-    # ModeSwitch. The mode object is the argument it is handed, and S68 showed
+    # ModeSwitch. The mode object is the argument it is handed, and §68 showed
     # there is no static route to that object -- 54657 rip-relative global loads
     # were walked and not one reaches the field -- so the only way to get it is
     # to take it from this call. Through 2.00 the anchor was the call shape
@@ -451,23 +450,37 @@ def derive_game_targets(exe_path):
                 continue
             key = (blob[i + 10], struct.unpack_from("<I", blob, i + 13)[0])
             g = sec.VirtualAddress + i + 7 + struct.unpack_from("<i", blob, i + 3)[0]
-            singles.setdefault(key, []).append(g)
+            singles.setdefault(key, []).append((sec.VirtualAddress + i, g))
     if not singles:
         raise RuntimeError("the MainCharGlobal singleton shape is absent from "
                            "this executable")
     (disp8, dfield), sites = max(singles.items(), key=lambda kv: len(kv[1]))
-    globals_ = set(sites)
+    globals_ = {g for _, g in sites}
     if len(sites) < 2 or len(globals_) != 1:
         raise RuntimeError(
             "the MainCharGlobal singleton scan is ambiguous: winning pair "
             f"(disp8=0x{disp8:X}, off=0x{dfield:X}) has {len(sites)} sites over "
             f"{len(globals_)} globals")
+    window = dfield & ~0xFF
+    # The retuned scan does not test the exact pair: it accepts any D in
+    # [window, window+0xFF] with that DISP8 and takes the first hit in address
+    # order. Run that predicate here and require every site it would accept to
+    # name the same global, so the build fails rather than the runtime scan
+    # quietly landing on a neighbour that happens to sort first.
+    accepted = sorted((site, g) for (d8, d), lst in singles.items()
+                      if d8 == disp8 and window <= d <= window + 0xFF
+                      for site, g in lst)
+    strays = [(site, g) for site, g in accepted if g not in globals_]
+    if strays:
+        raise RuntimeError(
+            "the retuned MainCharGlobal scan would also accept "
+            + ", ".join(f"game+0x{site:X} -> 0x{g:X}" for site, g in strays[:4])
+            + f" inside window 0x{window:X}..0x{window + 0xFF:X}")
     out["MAINCHAR_DISP8"] = disp8
-    out["MAINCHAR_WINDOW"] = dfield & ~0xFF
+    out["MAINCHAR_WINDOW"] = window
     out["MAINCHAR_GLOBAL"] = next(iter(globals_))
 
-    missing = [k for k in ("NAME_TO_KEY", "RESOLVE_ACTOR", "CAMP_NAME")
-               if k not in out]
+    missing = [k for k in ("RESOLVE_ACTOR", "CAMP_NAME") if k not in out]
     if missing:
         raise RuntimeError("could not derive from the executable: "
                            + ", ".join(missing))
@@ -1549,7 +1562,7 @@ def main() -> None:
     albl["hookinst"] = len(acode)
     ae("48 81 EC 98 00 00 00")                  # 0x98: room for an mbi at +0x58
     ae("48 C7 44 24 48 00 00 00 00")            # page slot = 0 until allocated
-    ae("48 C7 44 24 50 00 00 00 00")            # cursor slot = 0 until stage 3
+    ae("48 C7 44 24 50 00 00 00 00")            # kernel32 handle in stage 1, walk cursor from stage 3
     ar("8B 05", PS_HOOKED)
     ae("85 C0")
     aj("0F 85", "hi_out")                       # tried once already
