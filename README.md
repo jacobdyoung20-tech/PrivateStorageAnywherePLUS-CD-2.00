@@ -1,15 +1,15 @@
-# PrivateStorageAnywherePLUS — Crimson Desert 2.00
+# PrivateStorageAnywherePLUS — Crimson Desert 2.01.00
 
-An unofficial community compatibility and feature build of **PrivateStorageAnywherePLUS** for **Crimson Desert 2.00**.
+An unofficial community compatibility and feature build of **PrivateStorageAnywherePLUS** for **Crimson Desert 2.01.00**.
 
-Open Private Storage and all five housing storage panels from normal gameplay. Private Storage capacity can be changed in the INI, while the five housing chests remain expanded to 1,000 slots each.
+Open Private Storage and all five housing storage panels from normal gameplay. The five housing chests are expanded to 1,000 slots each in memory, as in earlier versions. The `PrivateStorageSlots` setting is inactive on 2.01.00 and must stay at 0.
 
 > [!IMPORTANT]
-> This build is matched to Crimson Desert 2.00 and has been tested only on that version. It will not work on 1.18.2 or earlier.
+> This build is matched to Crimson Desert 2.01.00 (`CrimsonDesert.exe` 1.0.0.2760) and has been tested only on that version. It will not work on 2.00 or earlier.
 
 ## Download
 
-Download `PrivateStorageAnywherePLUS-CD-2.00-FINAL.zip` from this repository's **Releases** page. The GitHub source archive is not the installable mod package.
+Download the latest release ZIP from this repository's **Releases** page (until a 2.01.00 release is cut, build the ASI as described in `BUILDING.md` and check it against the 2.01.00 value under [Verified release hashes](#verified-release-hashes)). The GitHub source archive is not the installable mod package.
 
 The released ASI is byte-for-byte identical to the build tested in game.
 
@@ -17,7 +17,7 @@ The released ASI is byte-for-byte identical to the build tested in game.
 
 | Key | Panel | Capacity behavior |
 | --- | --- | --- |
-| F4 | Private Storage | Configurable with `PrivateStorageSlots` |
+| F4 | Private Storage | Game default on 2.01.00 (`PrivateStorageSlots` is inactive, keep it at 0) |
 | F5 | Gatherables Chest | Fixed at 1,000 slots |
 | F6 | Dresser | Fixed at 1,000 slots |
 | F7 | Refrigerator | Fixed at 1,000 slots |
@@ -33,9 +33,9 @@ The released ASI is byte-for-byte identical to the build tested in game.
 
 ## Compatibility
 
-- Game: Crimson Desert 2.00
-- Executable: `bin64\CrimsonDesert.exe`
-- Expected PE `SizeOfImage`: `0x16499000`
+- Game: Crimson Desert 2.01.00
+- Executable: `bin64\CrimsonDesert.exe` (1.0.0.2760)
+- Expected PE `SizeOfImage`: `0x16F1F000`
 - ASI loader: required for manual installation
 
 A later game update may move internal functions again. If the mod stops working after an update, preserve `bin64\PrivateStorageAnywhere.log` before launching the game again and open a bug report.
@@ -44,10 +44,10 @@ A later game update may move internal functions again. If the mod stops working 
 
 ### DMM (recommended)
 
-1. Download `PrivateStorageAnywherePLUS-CD-2.00-FINAL.zip` from Releases.
+1. Download the latest release ZIP from Releases, or build the ASI yourself (see `BUILDING.md`).
 2. Import that ZIP into DMM.
 3. Disable or remove every other Private Storage Anywhere entry. Only one copy may be active.
-4. Enable this release and launch the game.
+4. Enable this release and launch the game. Nothing else is needed. The ASI is the whole mod.
 
 ### Manual
 
@@ -64,9 +64,13 @@ The two capacity features are independent.
 
 ### F5–F9 housing chests
 
-The five housing chests are always expanded to 1,000 slots. This runs on a separate path before `PrivateStorageSlots` is read. Changing the F4 setting cannot reduce these chests.
+The five housing chests are always expanded to 1,000 slots. The game loads chest capacity from its InventoryInfo table, where each record keeps `default_slot_count` at +0x48 and `max_slot_count` at +0x4A. The chests ship as `10 / 1000`, and a panel shows the default plus any purchased expansions. A few seconds after start, before any chest panel exists, the mod walks that table and rewrites every default of 10 to 1,000. The panels read the value when they open.
+
+The first 2.01.00 build walked a different table (the 1,119-record one behind the NameToKey call site) and so changed nothing. The build now takes the InventoryInfo manager from the game's own `[InventoryInfo]` error path and refuses to build if the deserializer stops placing `_defaultSlotCount` at +0x48.
 
 ### F4 Private Storage
+
+On 2.01.00 this setting is inactive and must stay at `0`. The lookup it relies on has not been re-derived for this version. The rest of this section describes earlier versions.
 
 Set `PrivateStorageSlots` under `[Settings]`:
 
@@ -87,10 +91,13 @@ Leave `PrivateStorageExpansions=-1` unless automatic expansion detection is wron
 ## Verified release hashes
 
 ```text
+PrivateStorageAnywhere.asi (Crimson Desert 2.01.00 build, exe 1.0.0.2760)
+0B426795A5C55F505ACF03444AF54BDA645A1B9BB86E73D514128016F6DC818B
+
 PrivateStorageAnywherePLUS-CD-2.00-FINAL.zip
 6EDE4EB366C46F56B32FABFCBD4CEBDD29F0E819C4DD984F9EA92D33E4BDC66F
 
-PrivateStorageAnywhere.asi
+PrivateStorageAnywhere.asi (Crimson Desert 2.00 release)
 C2B9848F33A3822532C563C31965F4DFF74B0D02A369AE7626D3E43056C49840
 
 PrivateStorageAnywhere.ini

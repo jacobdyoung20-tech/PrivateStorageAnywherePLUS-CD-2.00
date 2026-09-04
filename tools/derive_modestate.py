@@ -82,6 +82,36 @@ def find_tag_builder(pe, data, tag_vas):
     raise SystemExit("no code reference to any tag string")
 
 
+def find_tag_builders(pe, data, tag_vas):
+    """Every function that LEAs a tag string -> {(lo, hi): [tag names]}.
+
+    `find_tag_builder` returns only the *first* such function in address order,
+    which on 2.00 was BuildModeTagList itself. On 2.01.00 the compiler split the
+    mode dispatch from the sub-mode dispatch and the first tag LEA ("global", at
+    game+0x5CE76D) landed in the function *preceding* the builder, so the
+    17-entry sub-mode table -- the only place `store` is emitted -- was never
+    read and store_sub came back None. Collect every candidate instead and let
+    the caller union their tables.
+    """
+    base = pe.OPTIONAL_HEADER.ImageBase
+    out = {}
+    for section in code_sections(pe):
+        raw = section.get_data()
+        sva = base + section.VirtualAddress
+        for i in range(len(raw) - 7):
+            if raw[i] != 0x48 or raw[i + 1] != 0x8D or raw[i + 2] & 0xC7 != 0x05:
+                continue
+            target = sva + i + 7 + struct.unpack_from("<i", raw, i + 3)[0]
+            if target not in tag_vas:
+                continue
+            owner = owning_function(pe, section.VirtualAddress + i)
+            if owner:
+                out.setdefault(owner, []).append(tag_vas[target])
+    if not out:
+        raise SystemExit("no code reference to any tag string")
+    return out
+
+
 def owning_function(pe, rva):
     for entry in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", []):
         s = entry.struct
@@ -419,34 +449,56 @@ def _derive(path, verbose):
           f"'store' at 0x{[k for k, v in tag_vas.items() if v == 'store'][0]:X}")
 
     builder, lea = find_tag_builder(pe, data, tag_vas)
+    builders = find_tag_builders(pe, data, tag_vas)
     say(f"BuildModeTagList: game+0x{builder[0]:X}..0x{builder[1]:X} "
           f"(tag lea at game+0x{lea:X})")
+    for cand, tags in sorted(builders.items()):
+        if cand != builder:
+            say(f"  also references tags: game+0x{cand[0]:X}..0x{cand[1]:X} "
+                f"({', '.join(sorted(set(tags)))})")
 
     ingame_mode = store_sub = None
-    for tbl, entries in read_jump_tables(pe, builder, tag_vas):
-        labelled = [(i, t) for i, _, t in entries if t]
-        if not labelled:
-            continue
-        say(f"  jump table game+0x{tbl:X}:")
-        for i, tags in labelled:
-            say(f"    [{i:2d}] {', '.join(tags)}")
-        for i, tags in labelled:
-            if "ingame-global" in tags and ingame_mode is None:
-                ingame_mode = i
-            if "store" in tags:
-                store_sub = i
-
-    callers = callers_of(pe, base + builder[0])
-    say(f"callers of BuildModeTagList: {len(callers)}")
+    ambiguous = []
+    seen_tables = set()
+    for cand in sorted(builders):
+        for tbl, entries in read_jump_tables(pe, cand, tag_vas):
+            if tbl in seen_tables:
+                continue
+            seen_tables.add(tbl)
+            labelled = [(i, t) for i, _, t in entries if t]
+            if not labelled:
+                continue
+            say(f"  jump table game+0x{tbl:X} (from game+0x{cand[0]:X}):")
+            for i, tags in labelled:
+                say(f"    [{i:2d}] {', '.join(tags)}")
+            for i, tags in labelled:
+                if "ingame-global" in tags:
+                    if ingame_mode is not None and ingame_mode != i:
+                        ambiguous.append(f"ingame-global at {ingame_mode} and {i}")
+                    ingame_mode = i
+                if "store" in tags:
+                    if store_sub is not None and store_sub != i:
+                        ambiguous.append(f"store at {store_sub} and {i}")
+                    store_sub = i
+    if ambiguous:
+        raise SystemExit("ambiguous mode-tag dispatch: " + "; ".join(ambiguous))
 
     best = None
-    for va in callers:
-        func = owning_function(pe, va - base)
-        if not func or func == builder:
-            continue
-        derived = derive_from_modeswitch(pe, func, base + builder[0])
-        if derived[0] is not None and derived[2] is not None:
-            best = (func, derived)
+    for cand in [builder] + [c for c in sorted(builders) if c != builder]:
+        callers = callers_of(pe, base + cand[0])
+        if cand == builder:
+            say(f"callers of BuildModeTagList: {len(callers)}")
+        elif callers:
+            say(f"callers of game+0x{cand[0]:X}: {len(callers)}")
+        for va in callers:
+            func = owning_function(pe, va - base)
+            if not func or func == cand:
+                continue
+            derived = derive_from_modeswitch(pe, func, base + cand[0])
+            if derived[0] is not None and derived[2] is not None:
+                best = (func, derived)
+                break
+        if best:
             break
     if not best:
         raise SystemExit("could not identify ModeSwitch among the callers")
@@ -473,7 +525,8 @@ def _derive(path, verbose):
         say(f"  sanity: {name:<26} -> {state}")
     return {"mode": mode, "submode": submode, "flags": flags,
             "subtypes": subtypes, "dirty": dirty,
-            "ingame_mode": ingame_mode, "store_sub": store_sub}
+            "ingame_mode": ingame_mode, "store_sub": store_sub,
+            "modeswitch": func[0]}
 
 
 if __name__ == "__main__":

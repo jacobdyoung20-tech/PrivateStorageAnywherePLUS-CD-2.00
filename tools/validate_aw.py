@@ -248,13 +248,45 @@ def main() -> None:
           "the three trailing nops of the patch qword are emitted")
 
     # ------------------------------------------------------- stale-value sweep
-    print("\nstale 1.18.2 values")
-    for name, val in (("NAME_TO_KEY", 0x1E141D0), ("RESOLVE_ACTOR", 0x751D20),
-                      ("CAMP_NAME", 0x4FC0560), ("MAINCHAR", 0x62C1500)):
-        check(struct.pack("<I", val) not in img, f"no 1.18.2 {name} immediate survives")
-    for name, val in (("NAME_TO_KEY", 0x1E37F50), ("RESOLVE_ACTOR", 0x75BF90),
-                      ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", ms)):
-        check(struct.pack("<I", val) in img, f"2.00 {name} immediate present")
+    # Both halves used to name 2.00's addresses literally, which made the
+    # validator itself a stale constant: on 2.01.00 it demanded the presence of
+    # exactly the three addresses the build had correctly replaced. Check the
+    # derived targets are baked in, and that no address from any *other* game
+    # version survives, so this stays true for whatever version is built next.
+    derived = {"NAME_TO_KEY": targets["NAME_TO_KEY"],
+               "RESOLVE_ACTOR": targets["RESOLVE_ACTOR"],
+               "CAMP_NAME": targets["CAMP_NAME"],
+               "MODE_SWITCH": ms,
+               "INV_MGR_GLOBAL": targets["INV_MGR_GLOBAL"]}
+    # Hand-maintained: append a version's addresses here when it is superseded.
+    historical = (
+        ("1.18.2", (("NAME_TO_KEY", 0x1E141D0), ("RESOLVE_ACTOR", 0x751D20),
+                    ("CAMP_NAME", 0x4FC0560), ("MAINCHAR", 0x62C1500))),
+        ("2.00", (("NAME_TO_KEY", 0x1E37F50), ("RESOLVE_ACTOR", 0x75BF90),
+                  ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", 0x530E20),
+                  ("MAINCHAR", 0x6330A78))),
+        # 2.01.00's first build walked the manager behind the NameToKey site,
+        # which is not the InventoryInfo table; no build may bake it again.
+        ("2.01.00 wrong table", (("INV_MGR_GLOBAL", 0x6C2C078),)),
+    )
+    print("\nstale values from earlier game versions")
+    for ver, vals in historical:
+        for name, val in vals:
+            if val in derived.values():
+                continue          # this build legitimately targets that version
+            check(struct.pack("<I", val) not in img,
+                  f"no {ver} {name} immediate survives")
+    print("\nderived targets baked into the ASI")
+    for name, val in derived.items():
+        check(struct.pack("<I", val) in img,
+              f"derived {name} (0x{val:X}) immediate present")
+    # The retuned MainCharGlobal scan literals are positional, not immediates.
+    d8 = img[pe.get_offset_from_rva(P.MAINCHAR_DISP8_IMM)]
+    win = struct.unpack_from("<i", img, pe.get_offset_from_rva(P.MAINCHAR_WINDOW_DISP))[0]
+    check(d8 == targets["MAINCHAR_DISP8"],
+          f"MainChar scan disp8 literal is 0x{d8:X} (derived 0x{targets['MAINCHAR_DISP8']:X})")
+    check(win == -targets["MAINCHAR_WINDOW"],
+          f"MainChar scan window base is 0x{-win:X} (derived 0x{targets['MAINCHAR_WINDOW']:X})")
 
     if listing:
         print("\n--- AW block listing ---")

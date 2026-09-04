@@ -7,7 +7,7 @@ the panel-manager mounts the warehouse view -- using the 1.18.2 field layout.
 See FINDINGS-1.18.2-MODESTATE.md for the derivation of every constant here.
 
 Game side (RVAs on 0x140000000):
-    modeObj = *(menuMgr + 0x1158)
+    modeObj = *(menuMgr + MODE_OBJ_IN_MENUMGR)   # 0x1158 on 2.00, 0x1178 on 2.01.00
     modeObj + 0x18  mode        (4 == in-game)
     modeObj + 0x19  submode     (5 == dialog/store, 15/16 == gameplay)
     modeObj + 0x21  flags[7]        mode request, first non-zero index wins
@@ -17,6 +17,7 @@ Game side (RVAs on 0x140000000):
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 import sys
 from pathlib import Path
@@ -80,14 +81,51 @@ VP_PTR = PD_RVA + 24       # qword: cached VirtualProtect
 VA_PTR = PD_RVA + 32       # qword: cached VirtualAlloc
 PS_MODEOBJ = PD_RVA + 40   # qword: the mode object, as ModeSwitch received it
 PS_HOOKED = PD_RVA + 48    # dword: 0 untried, 1 installed, 2 gave up
+PS_DIAG_CURSOR = PD_RVA + 56  # qword: stage-3 walk cursor at the moment it gave up
+PS_DIAG_PAGE = PD_RVA + 64    # qword: the page stage 3 allocated, if it got that far
+PS_DIAG_FREE = PD_RVA + 72    # dword: MEM_FREE regions the walk saw
+PS_DIAG_TRIES = PD_RVA + 76   # dword: VirtualAlloc attempts it made
+PS_DIAG_CAND = PD_RVA + 80    # qword: the last candidate it tried
+PS_DIAG_ERR = PD_RVA + 88     # dword: GetLastError after the last failed VirtualAlloc
+GLE_PTR = PD_RVA + 96         # qword: GetLastError, resolved in stage 1
+PS_RETRIES = PD_RVA + 104     # dword: stage-3 soft failures so far (retried by the worker)
 BLOCKED_FMT = 0x2B108      # "BLOCKED: unsafe state (mode=0x%02X sub=0x%02X)"
 GETPROCADDRESS = 0x280F0   # IAT
+
+# The pristine mod resolves the game root ("MainCharGlobal") itself, by scanning
+# the game for `mov rax,[rip+G] ; mov REG,[rax+DISP8] ; cmp byte [REG+D],imm8`.
+# Both DISP8 and the window D falls in are literals inside that scan: 0x48 and
+# 0xC00..0xCFF. On 2.01.00 the game uses DISP8=0x10 and D=0xDD8, so the scan
+# found nothing, MainCharGlobal came back FAIL, and the mod's own readiness gate
+# -- which requires that global to be non-null -- aborted startup with
+# "FATAL: pattern scan failed". These two RVAs are where those literals live.
+MAINCHAR_DISP8_IMM = 0x9B5E    # the 0x48 in `cmp byte [rax+rdi], 0x48`
+MAINCHAR_WINDOW_DISP = 0x9B91  # the -0xC00 in `lea eax,[rcx-0xC00]`
+
+# The pristine mod also resolves the inventory manager itself, by scanning
+# SetInventory's body for `mov REG,[rip+G]` (an image-relative global at RVA
+# >= 0x3000000) followed within 0x60 bytes by `add r64,[REG+0x60|0x70|0x78]`,
+# the manager's bucket idiom. On 2.01.00 SetInventory no longer loads that
+# global at all -- the lookup was outlined into callees -- so the scan has zero
+# stage-1 candidates and cannot be retuned, only replaced. INV_MGR_SCAN is the
+# scan's entry; INV_MGR_FOUND is the success path it falls into, which stores
+# the slot address, logs it, and reloads the loop's exit flag from it.
+INV_MGR_SCAN = 0xA47E
+INV_MGR_SCAN_LEN = 0x25
+INV_MGR_FOUND = 0xA848
+INV_MGR_SCAN_ORIG = bytes.fromhex(
+    "488b1d3b300300"            # mov rbx,[SetInventory]
+    "4533e4"                    # xor r12d,r12d
+    "48c705fd30030000000000"    # mov qword[..],0
+    "4c8925fe300300"            # mov [InvMgrPtr],r12
+    "4885db"                    # test rbx,rbx
+    "0f84e8030000")             # je warn
 LOADLIBRARYA = 0x280F8     # IAT
 
 # --- 1.18.2 field layout ---------------------------------------------------
 L_MODE, L_SUB, L_FLAGS, L_SUBTYPES = 0x18, 0x19, 0x21, 0x28
 L_DIRTY = 0x4B
-MODE_OBJ_IN_MENUMGR = 0x1158
+MODE_OBJ_IN_MENUMGR = None   # derived from ModeSwitch's call site
 
 # ModeSwitch's first fifteen bytes: three 5-byte register spills, so the entry
 # splits on an instruction boundary and the first eight bytes are replaceable
@@ -168,51 +206,262 @@ def derive_game_targets(exe_path):
     import derive_modestate
 
     pe = pefile.PE(str(exe_path), fast_load=True)
+    pe.parse_data_directories(directories=[
+        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXCEPTION"]])
     code = [x for x in pe.sections if x.Characteristics & 0x20000000]
     data = Path(exe_path).read_bytes()
     out = {}
 
-    # NameToKey: the call whose result feeds the inventory manager's bucket
-    # resolution -- (key % bucketCount) << 8 added to [mgr+0x78]. That bucket
-    # idiom alone is generic (190 sites on 2.00), so the anchor is the call
-    # shape that precedes it: lea rdx,[rsp+N] / mov rcx,[rax] / call.
+    # NameToKey: `bool NameToKey(const char* name, uint16_t* outKey)`, the only
+    # game function the [PRIV] capacity feature calls. 2.00 located it from the
+    # call shape `lea rdx,[rsp+N] ; mov rcx,[rax] ; call` with the manager's
+    # bucket idiom -- (key % bucketCount) << 8 added to [mgr+0x78] -- within
+    # 0x60 after: three sites matched, two agreed, majority won. On 2.01.00 the
+    # caller loads the name with `mov rcx,[rcx]` rather than `mov rcx,[rax]`,
+    # so that sequence matches nothing at all and the derivation returned None.
+    #
+    # Widening the shape is not enough by itself. NameToKey is a
+    # StaticInfoManager2 template instantiation and this image carries about
+    # eighty-five of them, one per static-data table, structurally identical
+    # down to the bucket walk, the entry verify and the 0xFFFF miss sentinel.
+    # Which clone owns the inventory name table is decided by the data files
+    # the game loads, not by anything present in the executable, so it is not
+    # derivable from the exe -- the 2.00 majority vote picked a clone, and got
+    # a right answer by luck rather than by evidence.
+    #
+    # The clone is therefore pinned per game version, and everything that *is*
+    # checkable about it is checked below: it has to be a function start, it
+    # has to read its first argument as a C string and zero its second, and it
+    # has to be reached from a call site that hands it a stack out-slot, tests
+    # the result as a bool, and then walks the manager's buckets with the key
+    # it wrote back. A game update that moves or reshapes it fails the build
+    # instead of baking in a stale address, which is the failure §57 describes.
+    #
+    # Evidence for this address on 2.01.00 (exe 1.0.0.2760): the call site at
+    # game+0xFC913E reproduces §41's documented path instruction for
+    # instruction -- lea rdx,[rsp+0x20] ; mov rcx,[rcx] ; call ; test al,al ;
+    # je ; cmp [mgr+0x6c],0 ; mov [mgr+0x68] ; div ; shl r11,8 ;
+    # add r11,[mgr+0x78] ; cmp [bucket+i*8+8],key ; mov [bucket+i*8+0xc] ;
+    # mov [mgr+0x80] ; entry ; cmp word[entry+4],key.
+    INV_NAME_TO_KEY = 0x20BFF60
     bucket = bytes.fromhex("49C1E3084D035A78")
-    votes = {}
+
+    def _read(rva, n):
+        for sec in code:
+            at = rva - sec.VirtualAddress
+            blob = sec.get_data()
+            if 0 <= at < len(blob):
+                return blob[at:at + n]
+        return b""
+
+    starts = {e.struct.BeginAddress
+              for e in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", [])}
+    if INV_NAME_TO_KEY not in starts:
+        raise RuntimeError(f"NameToKey at {INV_NAME_TO_KEY:#x} is not a function "
+                           "start in this executable")
+    head = _read(INV_NAME_TO_KEY, 0x20)
+    spill = re.search(rb"\x48\x8B[\xC2\xCA\xD2\xDA\xEA\xF2\xFA]", head)   # mov r64,rdx
+    zero_out = re.search(rb"\x89[\x02\x0A\x12\x1A\x22\x2A\x32\x3A]", head)  # mov [rdx],r32
+    null_arg = b"\x48\x85\xC9" in head                                      # test rcx,rcx
+    # cmp byte[rcx],r8 / cmp byte[rcx],0 / movzx r32,byte[rcx]
+    cstr = re.search(rb"[\x40-\x47]?\x38[\x01\x09\x11\x19\x21\x29\x31\x39]"
+                     rb"|\x80\x39\x00|\x0F\xB6[\x01\x09\x11\x19\x21\x29\x31\x39]", head)
+    if not (spill and zero_out and null_arg and cstr):
+        raise RuntimeError(
+            f"NameToKey at {INV_NAME_TO_KEY:#x} no longer reads a C string in "
+            f"rcx and zeroes the out word in rdx: {head.hex()}")
+
+    # and it must still be called the way the feature calls it
+    managers = set()
+    call_shape = re.compile(
+        rb"\x48\x8D\x54\x24(.)(?:\x48|\x49)\x8B[\x08-\x0F\xC8-\xCF]\xE8....\x84\xC0",
+        re.S)
+    proof = 0
     for sec in code:
         blob = sec.get_data()
-        pos = 0
-        while True:
-            i = blob.find(b"\x48\x8d\x54\x24", pos)
-            if i < 0 or i + 13 > len(blob):
-                break
-            pos = i + 1
-            if blob[i + 5:i + 8] != b"\x48\x8b\x08" or blob[i + 8] != 0xE8:
+        for m in call_shape.finditer(blob):
+            ci = m.end() - 7
+            if sec.VirtualAddress + ci + 5 + struct.unpack_from("<i", blob, ci + 1)[0] \
+                    != INV_NAME_TO_KEY:
                 continue
-            if bucket not in blob[i + 13:i + 13 + 0x60]:
+            win = blob[ci + 5:ci + 5 + 0x60]
+            b = win.find(bucket)
+            if b < 0:
                 continue
-            rel = struct.unpack_from("<i", blob, i + 9)[0]
-            tgt = sec.VirtualAddress + i + 13 + rel
-            votes[tgt] = votes.get(tgt, 0) + 1
-    if votes:
-        best, n = max(votes.items(), key=lambda kv: kv[1])
-        if n >= 2:
-            out["NAME_TO_KEY"] = best
+            nn = m.group(1)[0]
+            slot = [bytes([0x8B, r, 0x24, nn]) for r in
+                    (0x44, 0x4C, 0x54, 0x5C, 0x64, 0x6C, 0x74, 0x7C)]
+            if not any(r in win[:b] for r in slot):
+                continue
+            proof += 1
+            # The manager whose buckets this key walks. It is reported at
+            # build time and nothing is derived from it: on 2.01.00 it is a
+            # different table from InventoryInfo, which is derived separately
+            # below and is the one every feature in this build walks.
+            for mm in re.finditer(rb"[\x48-\x4F]\x8B[\x05\x0D\x15\x1D\x25\x2D\x35\x3D]",
+                                  win[:b]):
+                k = mm.start()
+                if k + 7 <= b:
+                    managers.add(sec.VirtualAddress + ci + 5 + k + 7
+                                 + struct.unpack_from("<i", win, k + 3)[0])
+    if not proof:
+        raise RuntimeError(
+            f"no call site hands NameToKey at {INV_NAME_TO_KEY:#x} a stack "
+            "out-slot whose key then drives the manager's bucket walk")
+    if len(managers) != 1:
+        raise RuntimeError("the inventory manager behind NameToKey is not "
+                           "unique: " + str(sorted(hex(x) for x in managers)))
+    out["NAME_TO_KEY"] = INV_NAME_TO_KEY
+    out["NAME_TO_KEY_MGR"] = next(iter(managers))
 
-    # The actor handle resolver: spill rdx, hand [rcx+0x50] and rdx onward.
-    head = bytes.fromhex("4889542410534883EC30488BDA")
+    # The InventoryInfo manager the slot patcher walks. Until this build it was
+    # the manager behind the NameToKey site above, but a live survey on
+    # 2.01.00 (2026-09-04) found that one holding 1119 records of another
+    # table, so the pristine loop at ASI 0x8720 walked the wrong array and
+    # rewrote nothing. Anchor on the game's own InventoryInfo error path: the
+    # unique string "[InventoryInfo]" is referenced from exactly one function,
+    # which right before that reference resolves an InventoryInfoKey name and
+    # hands the key to the record getter. The getter, behind a `jmp` thunk,
+    # loads the manager global with `mov r11,[rip+disp]` and runs the bucket
+    # idiom on it ([mgr+0x6c] guard, [mgr+0x68] modulus, [mgr+0x78] buckets,
+    # [mgr+0x80] cells). That is the manager whose records carry the
+    # InventoryInfo slot words, whatever NameToKey clone the [PRIV] feature
+    # happens to call.
+    tag = b"[InventoryInfo]"      # opens the "[InventoryInfo] InventoryInfoKey[...]" message
+    tag_at = data.find(tag)
+    if tag_at < 0 or data.find(tag, tag_at + 1) >= 0:
+        raise RuntimeError("the [InventoryInfo] string is not unique in this executable")
+    tag_rva = pe.get_rva_from_offset(tag_at)
+    lea_rip = re.compile(rb"[\x48\x4C]\x8D[\x05\x0D\x15\x1D\x25\x2D\x35\x3D]")
+
+    def _lea_refs(target):
+        found = []
+        for sec in code:
+            blob = sec.get_data()
+            for m in lea_rip.finditer(blob):
+                k = m.start()
+                if sec.VirtualAddress + k + 7 + struct.unpack_from("<i", blob, k + 3)[0] == target:
+                    found.append((sec, k))
+        return found
+
+    sites = _lea_refs(tag_rva)
+    if len(sites) != 1:
+        raise RuntimeError(f"[InventoryInfo] is referenced from {len(sites)} sites, expected 1")
+    sec, k = sites[0]
+    # Every call in the window is body-checked, and the answer has to be
+    # unique. Taking the last qualifying call instead would be a guess: the
+    # bucket-walk shape below is the generic StaticInfoManager2 getter, shared
+    # by 110 functions over 56 different managers in this image, so a future
+    # exe that calls another table's getter here would hand back that table's
+    # manager with nothing to notice it. Two calls precede the reference today
+    # (the name resolver at game+0x1A145CC, then the getter at 0x1A145D9) and
+    # only the getter has this shape.
+    blob = sec.get_data()
+    lo = max(0, k - 0x40)
+    getters = {}
+    for m in re.finditer(rb"\xE8", blob[lo:k]):
+        ci = lo + m.start()
+        tgt = sec.VirtualAddress + ci + 5 + struct.unpack_from("<i", blob, ci + 1)[0]
+        head = _read(tgt, 5)
+        if len(head) != 5:
+            continue
+        if head[0] == 0xE9:                   # jmp thunk
+            tgt = tgt + 5 + struct.unpack_from("<i", head, 1)[0]
+        elif tgt not in starts:
+            continue
+        body = _read(tgt, 0x80)
+        mm = re.search(rb"\x4C\x8B\x1D(....)", body, re.S)   # mov r11,[rip+disp]
+        if not mm:
+            continue
+        if not (b"\xF7\xF1" in body and re.search(rb"\xC1[\xE0-\xE7]\x08", body)
+                and re.search(rb"\x83[\x78-\x7F]\x6C\x00", body)):
+            continue                          # div, shl 8, [mgr+0x6c] guard
+        getters[tgt] = tgt + mm.end() + struct.unpack("<i", mm.group(1))[0]
+    if len(getters) != 1:
+        raise RuntimeError(
+            "the [InventoryInfo] reference is not preceded by exactly one "
+            "record getter that walks a manager's buckets: "
+            + str(sorted(f"{g:#x}->{mgr:#x}" for g, mgr in getters.items())))
+    (getter, inv_mgr), = getters.items()
+    out["INV_MGR_GLOBAL"] = inv_mgr
+    out["INV_GETTER"] = getter
+
+    # The field the loop rewrites. The InventoryInfo deserializer reads
+    # _defaultSlotCount into the record with `lea rdx,[rec+OFF] ; mov r8d,2 ;
+    # call [vtbl+8]` and names the field in the message it logs when that
+    # read fails. Find the message, its single reference, and the lea before
+    # it; the pristine loop hardcodes +0x48 in a disp8, so a moved field must
+    # fail the build rather than write into whatever now lives at +0x48.
+    fld = data.find(b"_defaultSlotCount")
+    if fld < 0 or data.find(b"_defaultSlotCount", fld + 1) >= 0:
+        raise RuntimeError("the _defaultSlotCount message is not unique")
+    nul = data.rfind(b"\x00", fld - 0x40, fld)
+    if nul < 0:
+        raise RuntimeError("the _defaultSlotCount message does not start within 0x40 "
+                           "bytes of the field name")
+    msg_rva = pe.get_rva_from_offset(nul + 1)
+    refs = _lea_refs(msg_rva)
+    if len(refs) != 1:
+        raise RuntimeError(f"the _defaultSlotCount message has {len(refs)} references, expected 1")
+    sec, k = refs[0]
+    win = sec.get_data()[max(0, k - 0x30):k]
+    m = None
+    for m in re.finditer(rb"\x48\x8D[\x50-\x57](.)\x41\xB8\x02\x00\x00\x00", win, re.S):
+        pass                                   # the last one before the lea
+    if m is None:
+        raise RuntimeError("no `lea rdx,[rec+off] ; mov r8d,2` precedes the "
+                           "_defaultSlotCount message")
+    out["INV_SLOT_FIELD"] = m.group(1)[0]
+    if out["INV_SLOT_FIELD"] != 0x48:
+        raise RuntimeError(
+            f"InventoryInfo._defaultSlotCount now sits at +{out['INV_SLOT_FIELD']:#x}; the "
+            "pristine slot loop at ASI 0x8720 hardcodes +0x48 and must be relocated")
+
+    # The actor handle resolver, `Out* Resolve(Holder*, Out* out)`. 2.00 keyed on
+    # the exact prologue `mov [rsp+0x10],rdx ; push rbx ; sub rsp,0x30 ;
+    # mov rbx,rdx`, but that is register allocation rather than behaviour: on
+    # 2.01.00 the compiler dropped the home-slot spill and shrank the frame to
+    # 0x20, so the prologue matched 159 unrelated functions and the body test
+    # rejected all of them. Anchor on what the function has to do instead --
+    # keep the out pointer in rbx, read [rcx+0x50] off the holder, and hand rbx
+    # back as rcx -- bounded by the function's own end so a short neighbour
+    # cannot lend bytes to the window, and require a unique answer.
+    spill_out = bytes.fromhex("488BDA")     # mov rbx,rdx
+    holder_50 = bytes.fromhex("488B5150")   # mov rdx,[rcx+0x50]
+    out_as_rcx = bytes.fromhex("488BCB")    # mov rcx,rbx
+    resolvers = set()
+    blobs = [(sec.VirtualAddress, sec.get_data()) for sec in code]
+    for entry in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", []):
+        lo, hi = entry.struct.BeginAddress, entry.struct.EndAddress
+        for sva, blob in blobs:
+            at = lo - sva
+            if not 0 <= at < len(blob):
+                continue
+            head = blob[at:at + min(hi - lo, 0x40)]
+            if spill_out in head and holder_50 in head and out_as_rcx in head:
+                resolvers.add(lo)
+            break
+    if len(resolvers) == 1:
+        out["RESOLVE_ACTOR"] = resolvers.pop()
+    elif resolvers:
+        raise RuntimeError("the actor handle resolver is not unique: "
+                           + str(sorted(hex(x) for x in resolvers)))
+
+    # "CampWareHouse": two copies ship -- on 2.01.00 one of them is only the
+    # tail of "UI_WareHouse_KeyGuideFocusCampWareHouse" and nothing points at
+    # it -- so keep the one code actually loads. The pointing instruction is
+    # `lea r8,[rip+disp]` on 2.01.00 where 2.00 used a low register, so match
+    # any REX.W prefix instead of a literal 0x48; collecting every lea target
+    # once keeps this a single pass over the code.
+    lea_rip = re.compile(rb"[\x48-\x4F]\x8D[\x05\x0D\x15\x1D\x25\x2D\x35\x3D]", re.S)
+    lea_targets = set()
     for sec in code:
         blob = sec.get_data()
-        pos = 0
-        while "RESOLVE_ACTOR" not in out:
-            i = blob.find(head, pos)
-            if i < 0:
-                break
-            pos = i + 1
-            tail = blob[i:i + 0x40]
-            if bytes.fromhex("488B5150") in tail and bytes.fromhex("488BCB") in tail:
-                out["RESOLVE_ACTOR"] = sec.VirtualAddress + i
-
-    # "CampWareHouse": two copies ship; keep the one code actually points at.
+        for m in lea_rip.finditer(blob):
+            j = m.start()
+            if j + 7 <= len(blob):
+                lea_targets.add(sec.VirtualAddress + j + 7
+                                + struct.unpack_from("<i", blob, j + 3)[0])
     pos = 0
     while True:
         i = data.find(b"CampWareHouse\x00", pos)
@@ -223,81 +472,123 @@ def derive_game_targets(exe_path):
             rva = pe.get_rva_from_offset(i)
         except Exception:
             continue
-        for sec in code:
-            blob = sec.get_data()
-            p = 0
-            while True:
-                j = blob.find(b"\x48\x8d", p)
-                if j < 0 or j + 7 > len(blob):
-                    break
-                p = j + 1
-                if blob[j + 2] & 0xC7 != 0x05:
-                    continue
-                disp = struct.unpack_from("<i", blob, j + 3)[0]
-                if sec.VirtualAddress + j + 7 + disp == rva:
-                    out["CAMP_NAME"] = rva
-                    break
-            if "CAMP_NAME" in out:
-                break
+        if rva in lea_targets:
+            out["CAMP_NAME"] = rva
+            break
 
     # ModeSwitch. The mode object is the argument it is handed, and §68 showed
     # there is no static route to that object -- 54657 rip-relative global loads
-    # were walked and not one reaches +0x1158 -- so the only way to get it is to
-    # take it from this call. The anchor is the call shape itself: a
-    # `mov r64,[r64+0x1158]` immediately followed by `call rel32`. Four sites
-    # match on 2.00; exactly one of them calls a function whose first fifteen
-    # bytes are the three register spills MODE_SWITCH_PROLOGUE describes, and
-    # that one has exactly one direct caller image-wide.
-    import re
-    prologue = MODE_SWITCH_PROLOGUE
-    winners = {}
-    for sec in code:
-        blob = sec.get_data()
-        for m in re.finditer(rb"\x8B(.)\x58\x11\x00\x00\xE8", blob, re.S):
-            i = m.start()
-            if i < 1 or i + 11 > len(blob):
-                continue
-            modrm = m.group(1)[0]
-            if modrm >> 6 != 2 or (modrm & 7) == 4:
-                continue
-            if blob[i - 1] & 0xF8 != 0x48:
-                continue
-            rel = struct.unpack_from("<i", blob, i + 7)[0]
-            tgt = sec.VirtualAddress + i + 11 + rel
-            for host in code:
-                lo, blob2 = host.VirtualAddress, host.get_data()
-                if lo <= tgt < lo + len(blob2) - len(prologue):
-                    if blob2[tgt - lo:tgt - lo + len(prologue)] == prologue:
-                        winners[tgt] = host
-    if len(winners) != 1:
-        raise RuntimeError("ModeSwitch is not unique: "
-                           + str(sorted(hex(w) for w in winners)))
-    ms, host = next(iter(winners.items()))
-    # Exactly one direct caller is part of the evidence that this is the mode
-    # tick's ModeSwitch and not some other function with the same prologue.
-    blob = host.get_data()
-    callers = 0
-    pos = 0
-    while True:
-        i = blob.find(b"\xE8", pos)
-        if i < 0 or i + 5 > len(blob):
-            break
-        pos = i + 1
-        if host.VirtualAddress + i + 5 + struct.unpack_from("<i", blob, i + 1)[0] == ms:
-            callers += 1
-    if callers != 1:
-        raise RuntimeError(f"ModeSwitch at {ms:#x} has {callers} direct callers, expected 1")
+    # were walked and not one reaches the field -- so the only way to get it is
+    # to take it from this call. Through 2.00 the anchor was the call shape
+    # itself: `mov r64,[r64+0x1158]` immediately followed by `call rel32`. But
+    # 0x1158 is a game constant, not a shape: on 2.01.00 the mode object moved
+    # to menuMgr+0x1178, the search matched nothing, and the build stopped.
+    #
+    # Locate ModeSwitch through derive_modestate instead -- it is anchored on
+    # the UI tag strings and already has to find ModeSwitch to read the layout
+    # out of it -- and keep the three properties the old search relied on as
+    # checks rather than as the search itself. The menuMgr field is then read
+    # off the one call site, where the game spells it out.
+    layout = derive_modestate.derive(exe_path, verbose=False)
+    ms = layout["modeswitch"]
     if ms % 8:
         raise RuntimeError(f"ModeSwitch at {ms:#x} is not 8-byte aligned; the "
                            "hot-patch relies on a single aligned qword store")
-    out["MODE_SWITCH"] = ms
+    host = next((x for x in code
+                 if x.VirtualAddress <= ms < x.VirtualAddress + len(x.get_data())), None)
+    if host is None:
+        raise RuntimeError(f"ModeSwitch at {ms:#x} is not inside a code section")
+    at = ms - host.VirtualAddress
+    if host.get_data()[at:at + len(MODE_SWITCH_PROLOGUE)] != MODE_SWITCH_PROLOGUE:
+        raise RuntimeError(f"ModeSwitch at {ms:#x} does not begin with the three "
+                           "register spills the capture hook overwrites")
 
-    missing = [k for k in ("NAME_TO_KEY", "RESOLVE_ACTOR", "CAMP_NAME")
-               if k not in out]
+    # Exactly one direct caller is part of the evidence that this is the mode
+    # tick's ModeSwitch and not another function sharing its prologue. That one
+    # call site also carries the field the fallback walk needs, as the
+    # `mov rcx,[reg+disp32]` feeding the call.
+    sites, fields = [], []
+    for sec in code:
+        blob = sec.get_data()
+        pos = 0
+        while True:
+            i = blob.find(b"\xE8", pos)
+            if i < 0 or i + 5 > len(blob):
+                break
+            pos = i + 1
+            if sec.VirtualAddress + i + 5 + struct.unpack_from("<i", blob, i + 1)[0] != ms:
+                continue
+            sites.append(sec.VirtualAddress + i)
+            if i < 7:
+                continue
+            modrm = blob[i - 5]
+            if (blob[i - 7] in (0x48, 0x49) and blob[i - 6] == 0x8B
+                    and modrm >> 6 == 2 and (modrm >> 3) & 7 == 1 and modrm & 7 != 4):
+                fields.append(struct.unpack_from("<I", blob, i - 4)[0])
+    if len(sites) != 1:
+        raise RuntimeError(f"ModeSwitch at {ms:#x} has {len(sites)} direct "
+                           "callers, expected 1")
+    if len(fields) != 1 or not 0x100 <= fields[0] <= 0x4000:
+        raise RuntimeError("the mode object's field in menuMgr is not readable "
+                           f"from the call site at {sites[0]:#x}: {fields}")
+    out["MODE_SWITCH"] = ms
+    out["MODE_OBJ_IN_MENUMGR"] = fields[0]
+
+    # The parameters of the mod's own MainCharGlobal scan, re-derived the same
+    # way it scans: find every site matching the singleton shape with DISP8 and
+    # D left open, then take the (DISP8, D) pair with the most sites. Requiring
+    # that pair to resolve to exactly one global is the real check -- it is what
+    # says the scan will land on one answer rather than on whichever clone of
+    # the shape happens to come first in address order.
+    singles = {}
+    for sec in code:
+        blob = sec.get_data()
+        for m in re.finditer(rb"\x48\x8B\x05....\x48\x8B", blob, re.S):
+            i = m.start()
+            if i + 17 > len(blob):
+                continue
+            modrm = blob[i + 9]
+            if modrm & 0xC7 != 0x40 or blob[i + 11] != 0x80:
+                continue
+            if blob[i + 12] != (0xB8 | ((modrm >> 3) & 7)):
+                continue
+            key = (blob[i + 10], struct.unpack_from("<I", blob, i + 13)[0])
+            g = sec.VirtualAddress + i + 7 + struct.unpack_from("<i", blob, i + 3)[0]
+            singles.setdefault(key, []).append((sec.VirtualAddress + i, g))
+    if not singles:
+        raise RuntimeError("the MainCharGlobal singleton shape is absent from "
+                           "this executable")
+    (disp8, dfield), sites = max(singles.items(), key=lambda kv: len(kv[1]))
+    globals_ = {g for _, g in sites}
+    if len(sites) < 2 or len(globals_) != 1:
+        raise RuntimeError(
+            "the MainCharGlobal singleton scan is ambiguous: winning pair "
+            f"(disp8=0x{disp8:X}, off=0x{dfield:X}) has {len(sites)} sites over "
+            f"{len(globals_)} globals")
+    window = dfield & ~0xFF
+    # The retuned scan does not test the exact pair: it accepts any D in
+    # [window, window+0xFF] with that DISP8 and takes the first hit in address
+    # order. Run that predicate here and require every site it would accept to
+    # name the same global, so the build fails rather than the runtime scan
+    # quietly landing on a neighbour that happens to sort first.
+    accepted = sorted((site, g) for (d8, d), lst in singles.items()
+                      if d8 == disp8 and window <= d <= window + 0xFF
+                      for site, g in lst)
+    strays = [(site, g) for site, g in accepted if g not in globals_]
+    if strays:
+        raise RuntimeError(
+            "the retuned MainCharGlobal scan would also accept "
+            + ", ".join(f"game+0x{site:X} -> 0x{g:X}" for site, g in strays[:4])
+            + f" inside window 0x{window:X}..0x{window + 0xFF:X}")
+    out["MAINCHAR_DISP8"] = disp8
+    out["MAINCHAR_WINDOW"] = window
+    out["MAINCHAR_GLOBAL"] = next(iter(globals_))
+
+    missing = [k for k in ("RESOLVE_ACTOR", "CAMP_NAME") if k not in out]
     if missing:
         raise RuntimeError("could not derive from the executable: "
                            + ", ".join(missing))
-    out.update(derive_modestate.derive(exe_path, verbose=False))
+    out.update(layout)
     return out
 
 
@@ -308,10 +599,11 @@ def main() -> None:
     source, destination = Path(sys.argv[1]), Path(sys.argv[2])
 
     global CAMP_NAME, NAME_TO_KEY, RESOLVE_ACTOR, MODE_SWITCH
-    global L_MODE, L_SUB, L_FLAGS, L_SUBTYPES, L_DIRTY
+    global L_MODE, L_SUB, L_FLAGS, L_SUBTYPES, L_DIRTY, MODE_OBJ_IN_MENUMGR
     t = derive_game_targets(Path(sys.argv[3]))
     CAMP_NAME, NAME_TO_KEY, RESOLVE_ACTOR, MODE_SWITCH = (
         t["CAMP_NAME"], t["NAME_TO_KEY"], t["RESOLVE_ACTOR"], t["MODE_SWITCH"])
+    MODE_OBJ_IN_MENUMGR = t["MODE_OBJ_IN_MENUMGR"]
     L_MODE, L_SUB, L_FLAGS, L_SUBTYPES, L_DIRTY = (
         t["mode"], t["submode"], t["flags"], t["subtypes"], t["dirty"])
     # The mod resolves the store sub-index itself at runtime (ASI global
@@ -322,6 +614,14 @@ def main() -> None:
                            f"store={t['store_sub']}")
     print(f"derived  CampWareHouse=0x{CAMP_NAME:X} NameToKey=0x{NAME_TO_KEY:X} "
           f"ResolveActor=0x{RESOLVE_ACTOR:X} ModeSwitch=0x{MODE_SWITCH:X}")
+    print(f"derived  modeObj=menuMgr+0x{MODE_OBJ_IN_MENUMGR:X}")
+    print(f"derived  mainchar-scan disp8=0x{t['MAINCHAR_DISP8']:X} "
+          f"window=0x{t['MAINCHAR_WINDOW']:X}..0x{t['MAINCHAR_WINDOW'] + 0xFF:X} "
+          f"-> global=0x{t['MAINCHAR_GLOBAL']:X}")
+    print(f"derived  InventoryInfo manager global=0x{t['INV_MGR_GLOBAL']:X} "
+          f"(getter game+0x{t['INV_GETTER']:X}, via [InventoryInfo]); "
+          f"NameToKey site manager=0x{t['NAME_TO_KEY_MGR']:X}; "
+          f"_defaultSlotCount at rec+0x{t['INV_SLOT_FIELD']:X}")
     print(f"derived  ingame-mode={t['ingame_mode']} store-sub={t['store_sub']}")
     image = bytearray(source.read_bytes())
     digest = hashlib.sha256(image).hexdigest()
@@ -1271,6 +1571,7 @@ def main() -> None:
             ("vq",   b"VirtualQuery"),
             ("vp",   b"VirtualProtect"),
             ("va",   b"VirtualAlloc"),
+            ("gle",  b"GetLastError"),
             ("head", b"  [MODE] root=%llX menuMgr=%llX capture=%llX"),
             ("novq", b"  [MODE] VirtualQuery unavailable - probe skipped"),
             ("hkok", b"  [MODE] capture hook armed at %llX -> %llX"),
@@ -1364,8 +1665,11 @@ def main() -> None:
     # Volatile registers and its own frame only. Every failure is silent to the
     # game: it logs a stage number and leaves ModeSwitch untouched, which puts
     # the mod back to exactly AT's behaviour.
+
     albl["hookinst"] = len(acode)
-    ae("48 83 EC 58")
+    ae("48 81 EC 98 00 00 00")                  # 0x98: room for an mbi at +0x58
+    ae("48 C7 44 24 48 00 00 00 00")            # page slot = 0 until allocated
+    ae("48 C7 44 24 50 00 00 00 00")            # kernel32 handle in stage 1, walk cursor from stage 3
     ar("8B 05", PS_HOOKED)
     ae("85 C0")
     aj("0F 85", "hi_out")                       # tried once already
@@ -1391,6 +1695,16 @@ def main() -> None:
     ae("48 85 C0")
     aj("0F 84", "hi_fail")
     ar("48 89 05", VA_PTR)
+    ae("48 8B 4C 24 50")
+    ar("48 8D 15", av_strs["vq"])
+    ar("FF 15", GETPROCADDRESS)
+    ae("48 85 C0")
+    aj("0F 84", "hi_fail")
+    ar("48 89 05", VQ_PTR)
+    ae("48 8B 4C 24 50")
+    ar("48 8D 15", av_strs["gle"])
+    ar("FF 15", GETPROCADDRESS)
+    ar("48 89 05", GLE_PTR)                     # optional: null just skips the errno
 
     ae("B9 02 00 00 00")                        # stage 2: the bytes are still ours
     ae("89 4C 24 30")
@@ -1406,26 +1720,70 @@ def main() -> None:
     ae("48 39 50 07")
     aj("0F 85", "hi_fail")
 
-    ae("B9 03 00 00 00")                        # stage 3: a page within reach
+    # stage 3: a page within reach of ModeSwitch for the trampoline.
+    #
+    # 2.00 found one on its first guess, 1 MB below the image. 2.01.00 refused
+    # sixteen guesses at 16 MB steps below the base, and guessing harder is the
+    # wrong tool: whether an address is free depends on what the game and the
+    # other plugins in the process have reserved, which no static value can
+    # know. So stop guessing. Walk the address space with VirtualQuery from
+    # ~2 GB below the hook target upward, region by region, and allocate in the
+    # first MEM_FREE region that has a 64 KB-aligned page to spare. VirtualQuery
+    # skips a whole region per call, so this is a handful of calls, and stage 4
+    # still measures the displacement rather than trusting the walk's bound.
+    #
+    # mbi lives at [rsp+0x58]: BaseAddress +0x58, RegionSize +0x70, State +0x78.
+    ae("B9 03 00 00 00")
     ae("89 4C 24 30")
-    ar("48 8B 05", GAME_BASE)
-    ae("48 2D 00 00 10 00")                     # first hint: 1 MB below the image
-    ae("48 89 44 24 50")
-    ae("C7 44 24 34 10 00 00 00")               # 16 attempts, 16 MB apart
-    albl["hi_try"] = len(acode)
+    ae("48 8B 44 24 38")                        # rax = hook target
+    ae("48 2D 00 00 00 7F")                     # start 0x7F000000 below it
+    ae("48 3D 00 00 01 00")
+    aj("0F 8D", "hi_clamp")                     # signed: negative -> clamp
+    ae("B8 00 00 01 00")                        # lowest user address
+    albl["hi_clamp"] = len(acode)
+    ae("48 89 44 24 50")                        # cursor
+    albl["hi_walk"] = len(acode)
+    ae("48 8B 44 24 50")
+    ae("48 2B 44 24 38")                        # cursor - target
+    ae("48 3D 00 00 00 7F")
+    aj("0F 8F", "hi_f32")                       # 32: walked past +2 GB
     ae("48 8B 4C 24 50")
+    ae("48 8D 54 24 58")                        # &mbi
+    ae("41 B8 30 00 00 00")                     # sizeof(mbi)
+    ar("FF 15", VQ_PTR)
+    ae("48 85 C0")
+    aj("0F 84", "hi_f31")                       # 31: VirtualQuery returned 0
+    ae("8B 44 24 78")                           # mbi.State
+    ae("3D 00 00 01 00")                        # MEM_FREE
+    aj("0F 85", "hi_next")
+    ar("FF 05", PS_DIAG_FREE)                   # inc dword [free seen]
+    ae("48 8B 44 24 50")
+    ae("48 05 FF FF 00 00")
+    ae("48 25 00 00 FF FF")                     # candidate = align_up(cursor, 64 KB)
+    ae("48 8B 4C 24 58")
+    ae("48 03 4C 24 70")                        # region end
+    ae("48 8D 90 00 10 00 00")                  # candidate + 0x1000
+    ae("48 39 CA")
+    aj("0F 87", "hi_next")                      # page would spill past the region
+    ar("48 89 05", PS_DIAG_CAND)                # last candidate
+    ar("FF 05", PS_DIAG_TRIES)                  # inc dword [attempts]
+    ae("48 89 C1")
     ae("BA 00 10 00 00")                        # 0x1000 bytes
     ae("41 B8 00 30 00 00")                     # MEM_COMMIT | MEM_RESERVE
     ae("41 B9 04 00 00 00")                     # PAGE_READWRITE, execute later
     ar("FF 15", VA_PTR)
     ae("48 85 C0")
     aj("0F 85", "hi_got")
-    ae("48 8B 44 24 50")
-    ae("48 2D 00 00 00 01")
+    ar("48 8B 05", GLE_PTR)                     # errno of that failure, if resolvable
+    ae("48 85 C0")
+    aj("0F 84", "hi_next")
+    ae("FF D0")
+    ar("89 05", PS_DIAG_ERR)
+    albl["hi_next"] = len(acode)
+    ae("48 8B 44 24 58")
+    ae("48 03 44 24 70")                        # cursor = BaseAddress + RegionSize
     ae("48 89 44 24 50")
-    ae("FF 4C 24 34")
-    aj("0F 85", "hi_try")
-    aj("E9", "hi_fail")
+    aj("E9", "hi_walk")
     albl["hi_got"] = len(acode)
     ae("48 89 44 24 48")
     aj("48 8D 05", "capture")                   # lea rax,[capture]
@@ -1441,7 +1799,7 @@ def main() -> None:
     ae("4C 8D 4C 24 40")
     ar("FF 15", VP_PTR)
     ae("85 C0")
-    aj("0F 84", "hi_fail")
+    aj("0F 84", "hi_f33")                       # 33: RX protect of the new page failed
 
     ae("B9 04 00 00 00")                        # stage 4: the displacement fits
     ae("89 4C 24 30")
@@ -1483,12 +1841,38 @@ def main() -> None:
     ar("48 8D 0D", av_strs["hkok"])
     ar("E8", LOGGER)
     aj("E9", "hi_out")
+    for code in (31, 33):
+        albl["hi_f%d" % code] = len(acode)
+        ae("C7 44 24 30 %02X 00 00 00" % code)
+        aj("E9", "hi_fail")
+    # 32: nothing in reach *right now*. That is a property of the moment --
+    # mid-load the band is carved into slivers -- not of the process, so leave
+    # PS_HOOKED at 0 and let the worker's next cycle try again. Say so once,
+    # retry quietly, and only give up for good (36) after 600 attempts (~10 min).
+    albl["hi_f32"] = len(acode)
+    ae("C7 44 24 30 20 00 00 00")
+    ar("FF 05", PS_RETRIES)                     # inc dword [retries]
+    ar("8B 05", PS_RETRIES)
+    ae("3D 58 02 00 00")                        # 600 attempts: the worker sleeps 1 s per cycle, so ~10 min
+    aj("0F 8C", "hi_f32r")
+    ae("C7 44 24 30 24 00 00 00")               # 36: gave up after retrying
+    aj("E9", "hi_fail")
+    albl["hi_f32r"] = len(acode)
+    ae("31 C9")
+    ar("89 0D", PS_HOOKED)                      # PS_HOOKED = 0: try again later
+    ae("3D 01 00 00 00")
+    aj("0F 85", "hi_out")                       # retries after the first are silent
+    aj("E9", "hi_fail")                         # first time: log stage 32 once
     albl["hi_fail"] = len(acode)
+    ae("48 8B 44 24 50")
+    ar("48 89 05", PS_DIAG_CURSOR)              # where the walk was
+    ae("48 8B 44 24 48")
+    ar("48 89 05", PS_DIAG_PAGE)                # what, if anything, it allocated
     ae("8B 54 24 30")
     ar("48 8D 0D", av_strs["hkno"])
     ar("E8", LOGGER)
     albl["hi_out"] = len(acode)
-    ae("48 83 C4 58")
+    ae("48 81 C4 98 00 00 00")
     ae("C3")
 
     # ---- rdbl(rcx) -> al: is this exact address committed and readable? ----
@@ -1643,18 +2027,18 @@ def main() -> None:
         albl[skip] = len(acode)
 
     MENUMGR, ROOT = 0x78, 0x70
-    candidate(1,  MENUMGR, [0x1158])            # what AT uses today
+    candidate(1,  MENUMGR, [MODE_OBJ_IN_MENUMGR])       # the derived route
     candidate(2,  MENUMGR, [0x1150])
-    candidate(3,  MENUMGR, [0x1160])
-    candidate(4,  MENUMGR, [0x11A0])
-    candidate(5,  MENUMGR, [0x11A8])
+    candidate(3,  MENUMGR, [0x1158])            # where 2.00 kept it
+    candidate(4,  MENUMGR, [0x1160])
+    candidate(5,  MENUMGR, [0x11A0])
     candidate(6,  MENUMGR, [0x11B0])
     candidate(7,  MENUMGR, [0x11B8])
-    candidate(8,  MENUMGR, [0x28, 0x1158])
-    candidate(9,  ROOT,    [0x28, 0x1158])
-    candidate(10, ROOT,    [0x28, 0x28, 0x1158])   # the game's own shape
-    candidate(11, ROOT,    [0x1158])
-    candidate(12, ROOT,    [0x98, 0x1158])
+    candidate(8,  MENUMGR, [0x28, MODE_OBJ_IN_MENUMGR])
+    candidate(9,  ROOT,    [0x28, MODE_OBJ_IN_MENUMGR])
+    candidate(10, ROOT,    [0x28, 0x28, MODE_OBJ_IN_MENUMGR])   # the game's own shape
+    candidate(11, ROOT,    [MODE_OBJ_IN_MENUMGR])
+    candidate(12, ROOT,    [0x98, MODE_OBJ_IN_MENUMGR])
 
     albl["dgout"] = len(acode)
     ae("48 81 C4 A0 00 00 00")
@@ -1682,6 +2066,7 @@ def main() -> None:
 
 
 
+
     # (3) The per-entry slot field at +0x48 is CONFIRMED by the AH diagnostic.
     #     AH ran this same walk with the write NOP'd and reported 5 matches on
     #     every one of 167 worker passes, zero variance. The game's
@@ -1696,8 +2081,33 @@ def main() -> None:
     #     count goes to zero and the worker's `jle` skips logging entirely.
 
 
+    # ------------------------------------------------------------------ (H")
+    # Hand the inventory-manager slot straight to the success path. The scan
+    # this replaces cannot work on 2.01.00 at any tuning, so retuning it would
+    # only move the failure; the value it was looking for is derived above.
+    inv = Asm(INV_MGR_SCAN)
+    inv.riprel(b"\x48\x8B\x05", GAME_BASE)               # mov rax,[game base]
+    inv.raw(b"\x48\x05" + struct.pack("<I", t["INV_MGR_GLOBAL"]))   # add rax,rva
+    inv.raw(b"\x49\x89\xC7")                             # mov r15,rax
+    inv.raw(b"\x41\xBB" + struct.pack("<I", t["INV_MGR_GLOBAL"]))   # mov r11d,rva
+    inv.raw(b"\x33\xFF")                                 # xor edi,edi
+    inv.jmp32(INV_MGR_FOUND)                              # jmp found
+    if len(inv.bytes()) > INV_MGR_SCAN_LEN:
+        raise RuntimeError("the inventory-manager stub does not fit the scan "
+                           f"it replaces: {len(inv.bytes())} > {INV_MGR_SCAN_LEN}")
+    patch(pe, image, INV_MGR_SCAN, INV_MGR_SCAN_ORIG,
+          inv.pad_to(INV_MGR_SCAN_LEN).bytes())
+
+    # ------------------------------------------------------------------ (H')
+    # Retune the pristine MainCharGlobal scan to this executable. Nothing about
+    # the shape it looks for changes; only the two literals that 2.01.00 moved.
+    patch(pe, image, MAINCHAR_DISP8_IMM, b"\x48",
+          struct.pack("<B", t["MAINCHAR_DISP8"]))
+    patch(pe, image, MAINCHAR_WINDOW_DISP, struct.pack("<i", -0xC00),
+          struct.pack("<i", -t["MAINCHAR_WINDOW"]))
+
     # ------------------------------------------------------------------ (H)
-    old_tag, new_tag = b"CD 1.13.01", b"CD 2.00.AX"
+    old_tag, new_tag = b"CD 1.13.01", b"CD 2.01.00"   # same length as the tag it replaces
     at = image.find(old_tag)
     if at < 0 or image.find(old_tag, at + 1) >= 0:
         raise RuntimeError("expected exactly one build tag")

@@ -1,4 +1,4 @@
-# Reproducing the Crimson Desert 2.00 build
+# Reproducing the Crimson Desert 2.01.00 build
 
 The release is deterministic: the same pristine input ASI and the same Crimson Desert executable produce the same output bytes.
 
@@ -8,8 +8,8 @@ The release is deterministic: the same pristine input ASI and the same Crimson D
 - Packages in `requirements.txt`: `capstone`, `pefile`, and `py7zr`
 - A legally obtained pristine Private Storage Anywhere v1.5.10 ASI
   - SHA-256: `4F514298B2BC5DB7E804B0166AD2269BAE97A414F7DAE425A0F736CDA7F56F3E`
-- Crimson Desert 2.00 `bin64\CrimsonDesert.exe`
-  - Expected `SizeOfImage`: `0x16499000`
+- Crimson Desert 2.01.00 `bin64\CrimsonDesert.exe` (1.0.0.2760)
+  - Expected `SizeOfImage`: `0x16F1F000`
 
 The original ASI and game executable are not distributed in this repository.
 
@@ -35,11 +35,13 @@ python tools/patch_private_storage_1182_modestate.py `
 Expected result:
 
 ```text
-derived  CampWareHouse=0x501C6B8 NameToKey=0x1E37F50
-         ResolveActor=0x75BF90 ModeSwitch=0x530E20
+derived  CampWareHouse=0x57A0208 NameToKey=0x20BFF60 ResolveActor=0x1EC1430 ModeSwitch=0x5CF2B0
+derived  modeObj=menuMgr+0x1178
+derived  mainchar-scan disp8=0x10 window=0xD00..0xDFF -> global=0x6C29788
+derived  InventoryInfo manager global=0x6C2A038 (getter game+0x8752A40, via [InventoryInfo]); NameToKey site manager=0x6C2C078; _defaultSlotCount at rec+0x48
 derived  ingame-mode=4 store-sub=5
 layout   mode=0x28 sub=0x29 flags=0x31 subtypes=0x38 dirty=0x5B
-output_sha256=c2b9848f33a3822532c563c31965f4dff74b0d02a369ae7626d3e43056c49840
+output_sha256=0b426795a5c55f505acf03444af54bda645a1b9bb86e73d514128016f6dc818b
 ```
 
 The build stops if any anchor is missing, ambiguous, or internally inconsistent.
@@ -73,7 +75,7 @@ This prints the UI mode-tag pool, jump tables, located ModeSwitch, five field of
 The final ASI must match:
 
 ```text
-C2B9848F33A3822532C563C31965F4DFF74B0D02A369AE7626D3E43056C49840
+0B426795A5C55F505ACF03444AF54BDA645A1B9BB86E73D514128016F6DC818B
 ```
 
 Do not call a rebuild “the tested release” unless its hash matches exactly.
