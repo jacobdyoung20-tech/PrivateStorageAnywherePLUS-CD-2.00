@@ -256,12 +256,15 @@ def main() -> None:
     derived = {"NAME_TO_KEY": targets["NAME_TO_KEY"],
                "RESOLVE_ACTOR": targets["RESOLVE_ACTOR"],
                "CAMP_NAME": targets["CAMP_NAME"],
-               "MODE_SWITCH": ms}
+               "MODE_SWITCH": ms,
+               "INV_MGR_GLOBAL": targets["INV_MGR_GLOBAL"]}
+    # Hand-maintained: append a version's addresses here when it is superseded.
     historical = (
         ("1.18.2", (("NAME_TO_KEY", 0x1E141D0), ("RESOLVE_ACTOR", 0x751D20),
                     ("CAMP_NAME", 0x4FC0560), ("MAINCHAR", 0x62C1500))),
         ("2.00", (("NAME_TO_KEY", 0x1E37F50), ("RESOLVE_ACTOR", 0x75BF90),
-                  ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", 0x530E20))),
+                  ("CAMP_NAME", 0x501C6B8), ("MODE_SWITCH", 0x530E20),
+                  ("MAINCHAR", 0x6330A78))),
     )
     print("\nstale values from earlier game versions")
     for ver, vals in historical:
@@ -274,6 +277,13 @@ def main() -> None:
     for name, val in derived.items():
         check(struct.pack("<I", val) in img,
               f"derived {name} (0x{val:X}) immediate present")
+    # The retuned MainCharGlobal scan literals are positional, not immediates.
+    d8 = img[pe.get_offset_from_rva(P.MAINCHAR_DISP8_IMM)]
+    win = struct.unpack_from("<i", img, pe.get_offset_from_rva(P.MAINCHAR_WINDOW_DISP))[0]
+    check(d8 == targets["MAINCHAR_DISP8"],
+          f"MainChar scan disp8 literal is 0x{d8:X} (derived 0x{targets['MAINCHAR_DISP8']:X})")
+    check(win == -targets["MAINCHAR_WINDOW"],
+          f"MainChar scan window base is 0x{-win:X} (derived 0x{targets['MAINCHAR_WINDOW']:X})")
 
     if listing:
         print("\n--- AW block listing ---")
